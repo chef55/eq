@@ -23,6 +23,8 @@
 /* USER CODE BEGIN Includes */
 #define ARM_MATH_CM4
 #include "arm_math.h"
+#include <stdlib.h>
+    #include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,33 +39,41 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define clamp(x) max(-8388606 ,min(8388606, (x)))
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 I2S_HandleTypeDef hi2s2;
 I2S_HandleTypeDef hi2s3;
 DMA_HandleTypeDef hdma_spi2_rx;
 DMA_HandleTypeDef hdma_spi3_tx;
 
 /* USER CODE BEGIN PV */
-#define n 4096
-uint32_t buffer_in[n];
-uint32_t buffer_out[n];
-uint32_t * active_in = &buffer_in[0];
-uint32_t * active_out = &buffer_out[0];
-uint32_t * process_in = &buffer_in[n/2];
-uint32_t * process_out = &buffer_out[n/2];
+#define n 8192
+uint16_t buffer_in[n*2];
+uint16_t buffer_in_cpy[n];
+uint16_t buffer_out[n*2];
 
+uint16_t pos=n;
+uint16_t * process_in = &buffer_in_cpy[0];
+uint16_t * process_out = &buffer_out[n];
+uint8_t adc1=0;
+float m1=0,m2=0,m3=0;
+uint8_t ADC_Data[6];
 
 #define n_fft n/4
 
 arm_rfft_fast_instance_f32 fft;
-float fftIn[n_fft];
-float fftOut[n_fft];
-float ifftOut[n_fft];
+float overlap_add[n_fft];
+float fftIn[n_fft*2];
+float fftOut[n_fft*2];
 
-const double pi=3.14159265359;
+const float pi=3.14159265359;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -73,33 +83,46 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_I2S2_Init(void);
 static void MX_I2S3_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+
 void process(){
-	int N=n/2;
-	for(int i=0; i < N/2; i ++){
-		uint32_t a = (*(process_in+i*2)<<8);
-		uint32_t b = *(process_in+i*2)/16777216;
-		uint32_t tmp = a + b;
-		fftIn[i]=(float)(tmp);
+	for(int i=0; i < n_fft; i ++){
+		int32_t in = (int32_t)-((uint32_t) buffer_in_cpy[i*4] << 16 | (uint32_t)buffer_in_cpy[i*4+1])>>8;
+		fftIn[i]=((float)in);
 	}
-	//for(int i=0;i<n_fft;i++){
-	//	fftIn[i]*=1-0.1*cos(2*pi*i/(n_fft-1));
-	//}
+	for(int i=n_fft;i<n_fft*2;i++){
+		fftIn[i]=0.0f;
+	}
 	arm_rfft_fast_f32(&fft,fftIn,fftOut,0);
-	//fftOut[3]-= fftOut[3]*0.9;
-	//fftOut[3]-= 0.9*fftOut[3];
-	arm_rfft_fast_f32(&fft,fftOut,ifftOut,1);
-	for(int i=0;i<N/2;i++){
-		uint32_t a = ((uint32_t)(ifftOut[i]))>>8;
-		uint32_t b = ((uint32_t)ifftOut[i])<<24;
-		uint32_t tmp = a + b;
-		*(process_out+i*2) = tmp;
-		*(process_out+i*2+1) = tmp;
+	for(int i=2; i < 32; i+=2){
+		fftOut[i]*=m1;
+	}
+	for(int i=32; i < 500; i+=2){
+		fftOut[i]*=m2;
+	}
+	for(int i=500; i < 2000; i+=2){
+
+		fftOut[i]*=m3;
+	}
+	arm_rfft_fast_f32(&fft,fftOut,fftIn,1);
+
+	for(int i=0;i<n_fft;i++){
+		int32_t res = (int32_t)(fftIn[i]+overlap_add[i]);
+		res = clamp(res);
+		buffer_out[pos+i*4] = (uint16_t)(res >> 8);
+		buffer_out[pos+i*4+1] = (uint16_t)(res << 16);
+		buffer_out[pos+i*4+2] = buffer_out[pos+i*4];
+		buffer_out[pos+i*4+3] = buffer_out[pos+i*4+1];
+	}
+	for(int i=n_fft;i<n_fft*2;i++){
+		overlap_add[i]=fftIn[i+n_fft];
 	}
 }
 /* USER CODE END 0 */
@@ -139,15 +162,20 @@ int main(void)
   MX_DMA_Init();
   MX_I2S2_Init();
   MX_I2S3_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  arm_rfft_fast_init_f32(&fft, n_fft);
-  HAL_I2S_Receive_DMA(&hi2s2, (uint16_t*)buffer_in, n);
-  HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*)buffer_out, n);
+  for(int i=0;i<n_fft;i++){
+	  overlap_add[i]=0;
+  }
+  arm_rfft_fast_init_f32(&fft, n_fft*2);
+  HAL_I2S_Receive_DMA(&hi2s2, buffer_in, n);
+  HAL_I2S_Transmit_DMA(&hi2s3, buffer_out, n);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&ADC_Data, 3);
   while (1)
   {
     /* USER CODE END WHILE */
@@ -215,11 +243,72 @@ void PeriphCommonClock_Config(void)
   PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2S;
   PeriphClkInitStruct.PLLI2S.PLLI2SN = 128;
   PeriphClkInitStruct.PLLI2S.PLLI2SM = 16;
-  PeriphClkInitStruct.PLLI2S.PLLI2SR = 4;
+  PeriphClkInitStruct.PLLI2S.PLLI2SR = 2;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_8B;
+  hadc1.Init.ScanConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 3;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = 2;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = 3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -298,6 +387,7 @@ static void MX_DMA_Init(void)
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Stream3_IRQn interrupt configuration */
@@ -306,6 +396,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream5_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
 
@@ -333,28 +426,39 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s3)
 {
-
-
+	//process_in=&buffer_in[n];
+	//process_out=&buffer_out[n];
+	//pos=n;
+	//process();
 }
-void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s2)
+void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s3)
 {
-
+	//process_in=&buffer_in[0];
+	//process_out=&buffer_out[0];
+	//pos=0;
+	//process();
 }
 void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef *hi2s2)
 {
-
-	process_in=&buffer_in[0];
-	process_out=&buffer_out[0];
+	for(int i=0;i<n;i++){
+		buffer_in_cpy[i]=buffer_in[i];
+	}
+	pos=0;
 	process();
 }
 void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef *hi2s2)
 {
-	process_in=&buffer_in[n/2];
-	process_out=&buffer_out[n/2];
-	//for(int i=0;i<n/2;i++){
-	//	*(process_out+i)=*(process_in+i);
-	//}
+	for(int i=n;i<n*2;i++){
+		buffer_in_cpy[i-n]=buffer_in[i];
+	}
+	pos=n;
 	process();
+}
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc1)
+{
+	  m1 = powf(2.0f,((float)ADC_Data[0]-128.0f)/128.0f);
+	  m2 = powf(2.0f,((float)ADC_Data[1]-128.0f)/128.0f);
+	  m3 = powf(2.0f,((float)ADC_Data[2]-128.0f)/128.0f);
 }
 /* USER CODE END 4 */
 
